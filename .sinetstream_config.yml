@@ -1,0 +1,13 @@
+broker1:
+  type: mqtt
+  brokers: broker2.net.hiroshima-u.ac.jp:443
+  user_data_only: true
+  value_type: text
+  tls:
+    insecure: true
+#    cafile: null
+#    certfile: "client.crt"
+#    keyfile: "client.key"
+#  username_pw_set:
+#    username: "your_username"
+#    password: "your_password"
