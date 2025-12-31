@@ -15,7 +15,8 @@ import glob
 import shutil
 import logging
 import re
-from datetime import datetime
+import zipfile
+from datetime import datetime, timedelta
 from sinetstream import MessageWriter
 
 # ==== 設定セクション（環境に応じて修正） =====
@@ -46,11 +47,108 @@ PHASE_LAYERS = {
 # ディレクトリが存在しない場合は作成
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 
+
+# カスタムログハンドラー（100MBでローテーション、1~4のファイルを使用）
+class RotatingLogHandler(logging.Handler):
+    def __init__(self, base_filename, max_bytes=100*1024*1024, backup_count=4):
+        super().__init__()
+        self.base_filename = base_filename
+        self.max_bytes = max_bytes
+        self.backup_count = backup_count
+        self.current_file = None
+        self.current_file_num = None
+        self._open_current_file()
+    
+    def _get_log_filename(self, num):
+        """ログファイル名を取得（1~4の番号）"""
+        return f"{self.base_filename}.{num}"
+    
+    def _open_current_file(self):
+        """現在のログファイルを開く（必要に応じてローテーション）"""
+        # 使用可能なファイル番号を探す（1から順に）
+        self.current_file_num = self._find_next_available_file()
+        
+        # ファイルを開く
+        log_filename = self._get_log_filename(self.current_file_num)
+        self.current_file = open(log_filename, 'a', encoding='utf-8')
+    
+    def _find_next_available_file(self):
+        """次に使用可能なログファイル番号を探す"""
+        for num in range(1, self.backup_count + 1):
+            filename = self._get_log_filename(num)
+            if not os.path.exists(filename):
+                return num
+            if os.path.getsize(filename) < self.max_bytes:
+                return num
+        # すべて満杯の場合は1に戻る（古い1を削除して新しい1を作成）
+        return 1
+    
+    def _rotate(self):
+        """ログファイルをローテーション（4→3→2→1の順にシフト、1は削除）"""
+        # 4から2まで逆順にシフト（4→3, 3→2, 2→1）
+        for num in range(self.backup_count, 1, -1):
+            old_file = self._get_log_filename(num)
+            new_file = self._get_log_filename(num - 1)
+            
+            if os.path.exists(old_file):
+                # 次の番号のファイルが存在する場合は削除してから移動
+                if os.path.exists(new_file):
+                    os.remove(new_file)
+                os.rename(old_file, new_file)
+        
+        # 1のファイルは削除（新しい1が作成される）
+        file_1 = self._get_log_filename(1)
+        if os.path.exists(file_1):
+            os.remove(file_1)
+    
+    def emit(self, record):
+        """ログレコードを出力"""
+        try:
+            # 現在のファイルが満杯かチェック
+            if self.current_file:
+                current_size = os.path.getsize(self.current_file.name)
+                if current_size >= self.max_bytes:
+                    self.current_file.close()
+                    # 現在のファイルが4の場合はローテーション
+                    if self.current_file_num == self.backup_count:
+                        self._rotate()
+                    # 次のファイルを開く
+                    self._open_current_file()
+            
+            # ファイルが開かれていない場合は開く
+            if not self.current_file:
+                self._open_current_file()
+            
+            # 書き込み前に再度サイズチェック（他のプロセスが書き込んだ可能性がある）
+            if self.current_file:
+                current_size = os.path.getsize(self.current_file.name)
+                if current_size >= self.max_bytes:
+                    self.current_file.close()
+                    # 現在のファイルが4の場合はローテーション
+                    if self.current_file_num == self.backup_count:
+                        self._rotate()
+                    # 次のファイルを開く
+                    self._open_current_file()
+            
+            msg = self.format(record)
+            self.current_file.write(msg + '\n')
+            self.current_file.flush()
+        except Exception:
+            self.handleError(record)
+    
+    def close(self):
+        """ハンドラーを閉じる"""
+        if self.current_file:
+            self.current_file.close()
+        super().close()
+
+
 # ログ設定
+log_handler = RotatingLogHandler(LOG_FILE, max_bytes=100*1024*1024, backup_count=4)
+log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 logging.basicConfig(
-    filename=LOG_FILE,
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    handlers=[log_handler]
 )
 
 
@@ -88,17 +186,29 @@ def parse_csv_detail_to_json(csv_string):
     return result if result else None
 
 
-# すべてのタイムスタンプサブフォルダを取得
+# すべてのタイムスタンプサブフォルダを取得（実行時から10分前までのフォルダのみ）
 def get_all_timestamp_dirs():
     if not os.path.exists(UNSENT_DIR):
         return []
+    
+    # 現在時刻と10分前の時刻を取得
+    now = datetime.now()
+    ten_minutes_ago = now - timedelta(minutes=10)
     
     # タイムスタンプ形式のサブディレクトリを検索（YYYYMMDDHHMMSS形式）
     subdirs = []
     for item in os.listdir(UNSENT_DIR):
         item_path = os.path.join(UNSENT_DIR, item)
         if os.path.isdir(item_path) and len(item) == 14 and item.isdigit():
-            subdirs.append(os.path.join(UNSENT_DIR, item))
+            try:
+                # タイムスタンプをdatetimeオブジェクトに変換
+                folder_time = datetime.strptime(item, "%Y%m%d%H%M%S")
+                # 10分前から現在時刻までの範囲内かチェック
+                if ten_minutes_ago <= folder_time <= now:
+                    subdirs.append(os.path.join(UNSENT_DIR, item))
+            except ValueError:
+                # タイムスタンプのパースに失敗した場合はスキップ
+                continue
     
     # 名前でソート（古い順）
     subdirs.sort()
@@ -289,7 +399,7 @@ def save_csv(phases_data, target_dir):
     
     return csv_path
 
-# tmpディレクトリをそのまま~/log/sentに移動
+# tmpディレクトリをそのまま~/log/sentに移動してzip化
 def move_tmp_to_sent(tmp_dir):
     try:
         # SENT_DIRが存在しない場合は作成を試みる
@@ -314,8 +424,26 @@ def move_tmp_to_sent(tmp_dir):
             dest_dir = f"{dest_dir}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
         
         shutil.move(tmp_dir, dest_dir)
-        logging.info(f"tmpディレクトリを移動しました: {tmp_dir} -> {dest_dir}")
-        return dest_dir
+        
+        # zipファイル名を決定
+        zip_path = f"{dest_dir}.zip"
+        if os.path.exists(zip_path):
+            # 既にzipファイルが存在する場合は、タイムスタンプを追加
+            zip_path = f"{dest_dir}_{datetime.now().strftime('%Y%m%d%H%M%S')}.zip"
+        
+        # ディレクトリをzip化
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(dest_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    # zip内のパスは、dest_dirからの相対パスにする（ディレクトリ名を含む）
+                    arcname = os.path.relpath(file_path, os.path.dirname(dest_dir))
+                    zipf.write(file_path, arcname)
+        
+        # zip化が成功したら元のディレクトリを削除
+        shutil.rmtree(dest_dir)
+        logging.info(f"tmpディレクトリをzip化しました: {tmp_dir} -> {zip_path}")
+        return zip_path
     except PermissionError as e:
         logging.error(f"ログの移動に失敗しました（権限不足）: {e}")
     except Exception as e:
@@ -335,11 +463,9 @@ def publish_to_mqtt(phases_data, hostname):
         topic = f"{MQTT_TOPIC_BASE}/{hostname}/phase{phase}"
         msg = json.dumps(phase_json, ensure_ascii=False)
 
-        logging.info(f"[MQTT] publish → {topic} (QoS={MQTT_QOS})")
         try:
             with MessageWriter(SERVICE, topic=topic, qos=MQTT_QOS, retain=MQTT_RETAIN) as w:
                 w.publish(msg)
-            logging.info(f"  ✓ 成功: {topic}")
             success_count += 1
         except Exception as e:
             logging.error(f"  ✗ 失敗: {topic} - {e}")
@@ -347,9 +473,43 @@ def publish_to_mqtt(phases_data, hostname):
     
     return success_count, fail_count
 
+# sentフォルダ内の30日より前のzipファイルを削除
+def cleanup_old_zips():
+    """sentフォルダ内の30日より前のzipファイルを削除する"""
+    if not os.path.exists(SENT_DIR):
+        return
+    
+    # 現在時刻と30日前の時刻を取得
+    now = datetime.now()
+    thirty_days_ago = now - timedelta(days=30)
+    
+    # zipファイルを検索
+    zip_pattern = os.path.join(SENT_DIR, "*.zip")
+    zip_files = glob.glob(zip_pattern)
+    
+    deleted_count = 0
+    for zip_file in zip_files:
+        try:
+            # ファイルの最終更新時刻を取得
+            file_mtime = os.path.getmtime(zip_file)
+            file_time = datetime.fromtimestamp(file_mtime)
+            
+            # 30日より前のファイルを削除
+            if file_time < thirty_days_ago:
+                os.remove(zip_file)
+                deleted_count += 1
+                logging.info(f"古いzipファイルを削除しました: {zip_file} (最終更新: {file_time.strftime('%Y-%m-%d %H:%M:%S')})")
+        except OSError as e:
+            logging.warning(f"zipファイルの削除に失敗しました: {zip_file} - {e}")
+        except Exception as e:
+            logging.warning(f"zipファイルの処理中にエラーが発生しました: {zip_file} - {e}")
+    
+    if deleted_count > 0:
+        logging.info(f"古いzipファイルの削除完了: {deleted_count}個のファイルを削除しました")
+
+
 # 指定されたタイムスタンプフォルダを処理（CSV保存、MQTT送信、移動）
 def process_timestamp_dir(timestamp_dir):
-    logging.info(f"\n{'='*60}")
     logging.info(f"処理中: {timestamp_dir}")
     
     # tmpに残っているログが実行中かどうかを確認
@@ -360,38 +520,27 @@ def process_timestamp_dir(timestamp_dir):
     # campaign UUIDを取得
     try:
         campaign_uuid, hostname = get_campaign_uuid_from_dir(timestamp_dir)
-        logging.info(f"Campaign UUID: {campaign_uuid}")
-        logging.info(f"Campaign Hostname: {hostname}")
     except FileNotFoundError as e:
         logging.error(f"{e} - スキップします")
         return False
     
     # 各PhaseのJSONデータを読み込む
-    logging.info("\n=== Phaseデータの読み込み ===")
     phases_data = {}
     for phase in range(7):  # Phase 0-6
         phase_json = load_phase_json(phase, campaign_uuid, timestamp_dir)
         if phase_json:
             phases_data[phase] = phase_json
-            data = phase_json.get("data", {})
-            data_count = len(data) if isinstance(data, dict) else len(data)
-            logging.info(f"Phase {phase} ({PHASE_LAYERS[phase]}): {data_count}件のデータを読み込み")
         else:
-            logging.info(f"Phase {phase} ({PHASE_LAYERS[phase]}): データが見つかりませんでした")
             phases_data[phase] = None
     
     # CSVファイルに保存
-    logging.info("\n=== CSVファイルの保存 ===")
     csv_path = save_csv(phases_data, timestamp_dir)
-    logging.info(f"保存先: {csv_path}")
     
     # MQTTブローカにpublish
-    logging.info("\n=== MQTTブローカへの公開 ===")
     success_count, fail_count = publish_to_mqtt(phases_data, hostname)
     
     # 送信が成功した場合のみtmpディレクトリをsentに移動
     if success_count > 0:
-        logging.info("\n=== tmpディレクトリの移動 ===")
         move_tmp_to_sent(timestamp_dir)
         return True
     else:
@@ -410,8 +559,6 @@ def main():
             return
         
         logging.info(f"処理対象フォルダ数: {len(timestamp_dirs)}")
-        for i, dir_path in enumerate(timestamp_dirs, 1):
-            logging.info(f"  {i}. {dir_path}")
     except Exception as e:
         logging.error(f"エラー: {e}")
         return
@@ -429,7 +576,9 @@ def main():
             logging.error(f"{timestamp_dir} の処理中にエラーが発生しました: {e}")
             total_fail += 1
     
-    logging.info(f"\n{'='*60}")
+    # 30日より前のzipファイルを削除
+    cleanup_old_zips()
+    
     logging.info("=== 処理完了 ===")
 
 
