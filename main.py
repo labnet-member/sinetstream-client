@@ -15,6 +15,7 @@ import glob
 import shutil
 import logging
 import re
+import socket
 import zipfile
 from datetime import datetime, timedelta
 from sinetstream import MessageWriter
@@ -23,7 +24,7 @@ from sinetstream import MessageWriter
 # ディレクトリ設定
 UNSENT_DIR = os.path.expanduser("~/log/tmp")
 SENT_DIR = os.path.expanduser("~/log/sent")
-LOG_FILE = os.path.expanduser("~/log/publish_by_ss.log")
+LOG_FILE = os.path.expanduser("~/log/python.log")
 
 # SINETStream Writer 設定
 SERVICE = "broker1"        # SINETStream のサービス名
@@ -48,9 +49,9 @@ PHASE_LAYERS = {
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 
 
-# カスタムログハンドラー（100MBでローテーション、1~4のファイルを使用）
+# カスタムログハンドラー（10MBでローテーション、1~4のファイルを使用）
 class RotatingLogHandler(logging.Handler):
-    def __init__(self, base_filename, max_bytes=100*1024*1024, backup_count=4):
+    def __init__(self, base_filename, max_bytes=10*1024*1024, backup_count=4):
         super().__init__()
         self.base_filename = base_filename
         self.max_bytes = max_bytes
@@ -152,6 +153,14 @@ logging.basicConfig(
 )
 
 
+# ホスト名をOSから取得（MQTTトピック・zip名に使用）
+def get_hostname():
+    try:
+        return socket.gethostname() or "unknown-host"
+    except Exception:
+        return "unknown-host"
+
+
 # キャンペーンログファイルの有無で実行中かどうかを判断
 def is_log_running(log_dir):
     return os.path.exists(os.path.join(log_dir, "campaign_*.json"))
@@ -224,10 +233,38 @@ def get_campaign_uuid_from_dir(target_dir):
 
     with open(campaign_files[0], 'r', encoding='utf-8') as f:
         campaign_data = json.load(f)
-        # hostname を取得できるように変更。存在しない場合はフォールバック値を使用。
         campaign_uuid = campaign_data.get("log_campaign_uuid")
-        hostname = campaign_data.get("hostname") or "unknown-host"
-        return campaign_uuid, hostname
+        return campaign_uuid
+
+
+# campaign_*.json が無い場合に、sindan_*.json から campaign_uuid を1つ取得（同一ディレクトリ内では1つとみなす）
+def get_campaign_uuid_from_sindan(target_dir):
+    """ディレクトリ内の sindan_*.json を走査し、campaign_uuid を1つ返す。見つからなければ None。"""
+    for layer in PHASE_LAYERS.values():
+        pattern = os.path.join(target_dir, f"sindan_{layer}_*.json")
+        for json_path in glob.glob(pattern):
+            try:
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    if "wlan_environment" in json_path:
+                        pattern_re = r'"detail"\s*:\s*"'
+                        match = re.search(pattern_re, content)
+                        if match:
+                            start_pos = match.end()
+                            end_pattern = r'",\s*"occurred_at"'
+                            end_match = re.search(end_pattern, content[start_pos:])
+                            if end_match:
+                                end_pos = start_pos + end_match.start()
+                                detail_value = content[start_pos:end_pos]
+                                detail_value = detail_value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '\\r')
+                                content = content[:start_pos] + detail_value + content[start_pos + len(detail_value):end_pos] + content[end_pos:]
+                    data = json.loads(content)
+                    uid = data.get("log_campaign_uuid")
+                    if uid:
+                        return uid
+            except (json.JSONDecodeError, IOError):
+                continue
+    return None
 
 
 # 指定されたPhaseのJSONファイルを読み込んで1つのJSONオブジェクトにまとめる
@@ -516,14 +553,19 @@ def process_timestamp_dir(timestamp_dir):
     if is_log_running(timestamp_dir):
         logging.warning(f"ログディレクトリ {timestamp_dir} は実行中の可能性があります。スキップします。")
         return False
-    
-    # campaign UUIDを取得
+
+    hostname = get_hostname()
+
+    # campaign UUIDを取得（無い場合は sindan_*.json から1つ取得。同一ディレクトリ内では1つとみなす）
     try:
-        campaign_uuid, hostname = get_campaign_uuid_from_dir(timestamp_dir)
-    except FileNotFoundError as e:
-        logging.error(f"{e} - スキップします")
-        return False
-    
+        campaign_uuid = get_campaign_uuid_from_dir(timestamp_dir)
+    except FileNotFoundError:
+        campaign_uuid = get_campaign_uuid_from_sindan(timestamp_dir)
+        if campaign_uuid is None:
+            logging.error(f"campaign JSONが無く、sindan_*.json からも campaign_uuid を取得できませんでした: {timestamp_dir} - スキップします")
+            return False
+        logging.info(f"campaign JSONが無いため、sindan_*.json から取得した campaign_uuid で送信・zip化します")
+
     # 各PhaseのJSONデータを読み込む
     phases_data = {}
     for phase in range(7):  # Phase 0-6
@@ -532,14 +574,16 @@ def process_timestamp_dir(timestamp_dir):
             phases_data[phase] = phase_json
         else:
             phases_data[phase] = None
-    
+
+    if not any(phases_data.get(p) for p in range(7)):
+        logging.warning(f"有効なPhaseデータが無いためスキップします: {timestamp_dir}")
+        return False
+
     # CSVファイルに保存
-    csv_path = save_csv(phases_data, timestamp_dir)
-    
+    save_csv(phases_data, timestamp_dir)
     # MQTTブローカにpublish
     success_count, fail_count = publish_to_mqtt(phases_data, hostname)
-    
-    # 送信が成功した場合のみtmpディレクトリをsentに移動
+    # 送信が成功した場合のみtmpディレクトリをsentに移動してzip化
     if success_count > 0:
         move_tmp_to_sent(timestamp_dir)
         return True
