@@ -1,11 +1,13 @@
 [project]
 name = "sinetstream-client"
 version = "0.1.0"
-description = "Add your description here"
+description = "SINDAN 結果を SINET Stream (MQTT) に送信するクライアント（uv で管理）"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "logging>=0.4.9.6",
     "sinetstream>=1.9.2",
     "sinetstream-mqtt>=1.9.2",
 ]
+
+[tool.uv]
+# このプロジェクトは uv で依存解決・仮想環境を管理します（uv sync / uv run）
