@@ -110,6 +110,7 @@ class RotatingLogHandler(logging.Handler):
                 current_size = os.path.getsize(self.current_file.name)
                 if current_size >= self.max_bytes:
                     self.current_file.close()
+                    self.current_file = None
                     # 現在のファイルが4の場合はローテーション
                     if self.current_file_num == self.backup_count:
                         self._rotate()
@@ -125,12 +126,15 @@ class RotatingLogHandler(logging.Handler):
                 current_size = os.path.getsize(self.current_file.name)
                 if current_size >= self.max_bytes:
                     self.current_file.close()
+                    self.current_file = None
                     # 現在のファイルが4の場合はローテーション
                     if self.current_file_num == self.backup_count:
                         self._rotate()
                     # 次のファイルを開く
                     self._open_current_file()
             
+            if not self.current_file:
+                return
             msg = self.format(record)
             self.current_file.write(msg + '\n')
             self.current_file.flush()
@@ -144,8 +148,8 @@ class RotatingLogHandler(logging.Handler):
         super().close()
 
 
-# ログ設定
-log_handler = RotatingLogHandler(LOG_FILE, max_bytes=100*1024*1024, backup_count=4)
+# ログ設定（10MBでローテーション、.1〜.4 の4ファイルを使用）
+log_handler = RotatingLogHandler(LOG_FILE, max_bytes=10*1024*1024, backup_count=4)
 log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 logging.basicConfig(
     level=logging.INFO,
