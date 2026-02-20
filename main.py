@@ -320,7 +320,7 @@ def move_tmp_to_sent(tmp_dir):
         
         # ZIP 化が成功したら元のディレクトリを削除
         shutil.rmtree(dest_dir)
-        logging.info(f"TMP_DIR を ZIP 化しました: {tmp_dir} -> {zip_path}")
+        logging.info(f"ログを移動して ZIP 化しました: {tmp_dir} -> {zip_path}")
         return zip_path
     except Exception as e:
         logging.error(f"ログの移動に失敗しました: {e} - スキップします")
